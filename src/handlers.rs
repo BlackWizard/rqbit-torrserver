@@ -117,14 +117,56 @@ async fn torrents_add(
     }
 
     // Spawn torrent addition in background so it continues even if we return early
-    let add_torrent = AddTorrent::Url(std::borrow::Cow::Owned(link));
+    let add_torrent = AddTorrent::Url(std::borrow::Cow::Owned(link.clone()));
     let session = state.session.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
+    println!("[DHT] Adding torrent: hash={}", hash);
+    println!("[DHT] Link: {}", link);
+
+    let hash_for_log = hash.clone();
     tokio::spawn(async move {
+        println!("[DHT] Starting DHT lookup for hash={}", hash_for_log);
+        let start = std::time::Instant::now();
         let result = session.add_torrent(add_torrent, None).await;
-        if let Err(ref e) = result {
-            eprintln!("Error adding torrent: {}", e);
+        let elapsed = start.elapsed();
+        match &result {
+            Ok(librqbit::AddTorrentResponse::Added(id, handle)) => {
+                println!(
+                    "[DHT] Torrent metadata resolved: hash={}, id={}, name={:?}, took {:?}",
+                    hash_for_log,
+                    id,
+                    handle.name(),
+                    elapsed
+                );
+                // Spawn background task to monitor hashing progress
+                let handle_clone = handle.clone();
+                let hash_for_monitor = hash_for_log.clone();
+                tokio::spawn(async move {
+                    monitor_hashing_progress(handle_clone, hash_for_monitor).await;
+                });
+            }
+            Ok(librqbit::AddTorrentResponse::AlreadyManaged(id, handle)) => {
+                println!(
+                    "[DHT] Torrent already managed: hash={}, id={}, name={:?}, took {:?}",
+                    hash_for_log,
+                    id,
+                    handle.name(),
+                    elapsed
+                );
+            }
+            Ok(librqbit::AddTorrentResponse::ListOnly(_)) => {
+                println!(
+                    "[DHT] List only response: hash={}, took {:?}",
+                    hash_for_log, elapsed
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[DHT] Error adding torrent: hash={}, error={}",
+                    hash_for_log, e
+                );
+            }
         }
         let _ = tx.send(result);
     });
@@ -175,14 +217,23 @@ async fn torrents_add(
             }
         }
         Ok(Ok(Err(e))) => {
+            eprintln!(
+                "[DHT] Add torrent failed immediately: hash={}, error={}",
+                hash, e
+            );
             return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
         Ok(Err(_)) => {
             // Channel closed - shouldn't happen
+            println!("[DHT] Channel closed unexpectedly: hash={}", hash);
         }
         Err(_) => {
             // Timeout - torrent is being added in background, metadata not ready yet
             // This is expected for magnet links
+            println!(
+                "[DHT] Timeout waiting for metadata (5s), DHT lookup continues in background: hash={}",
+                hash
+            );
         }
     }
 
@@ -300,17 +351,45 @@ async fn torrents_set(
         "hash is required for set action".to_string(),
     ))?;
 
-    // Verify torrent exists
-    let id = TorrentIdOrHash::try_from(hash.as_str())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let _ = state
-        .api
-        .mgr_handle(id)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let hash_lower = hash.to_lowercase();
 
-    // In TorrServer, set updates metadata like title/poster/category
-    // rqbit doesn't have this concept, so we just acknowledge
-    Ok(Json(serde_json::json!({"status": "ok"})).into_response())
+    // Update metadata in store
+    {
+        let mut store = state.torrent_metadata.write().await;
+        if let Some(metadata) = store.get_mut(&hash_lower) {
+            if let Some(title) = req.title {
+                metadata.title = title;
+            }
+            if let Some(poster) = req.poster {
+                metadata.poster = poster;
+            }
+            if let Some(category) = req.category {
+                metadata.category = category;
+            }
+            if let Some(data) = req.data {
+                metadata.data = data;
+            }
+        } else {
+            // Create new metadata entry if doesn't exist
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            store.insert(
+                hash_lower,
+                TorrentMetadata {
+                    title: req.title.unwrap_or_default(),
+                    poster: req.poster.unwrap_or_default(),
+                    category: req.category.unwrap_or_default(),
+                    data: req.data.unwrap_or_default(),
+                    timestamp,
+                },
+            );
+        }
+    }
+
+    // TorrServer returns just HTTP 200 with no body
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn torrents_remove(
@@ -322,32 +401,72 @@ async fn torrents_remove(
         "hash is required for rem/drop action".to_string(),
     ))?;
 
+    let hash_lower = hash.to_lowercase();
+
+    // Always remove from metadata store
+    state.torrent_metadata.write().await.remove(&hash_lower);
+
+    // Try to delete from session (may fail if torrent is still resolving)
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    state
-        .session
-        .delete(id, false)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Ignore errors - torrent might not be in session yet
+    let _ = state.session.delete(id, false).await;
 
-    Ok(Json(serde_json::json!({"status": "ok"})).into_response())
+    // TorrServer returns just HTTP 200 with no body
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn torrents_list(state: Arc<AppState>) -> Result<Response, (StatusCode, String)> {
     let list = state.api.api_torrent_list();
+    let metadata_store = state.torrent_metadata.read().await;
 
-    let torrents: Vec<TorrentStatus> = list
+    // Get hashes of torrents already in librqbit session
+    let session_hashes: std::collections::HashSet<String> = list
         .torrents
         .iter()
-        .map(|t| TorrentStatus {
-            hash: t.info_hash.clone(),
-            name: t.name.clone().unwrap_or_default(),
-            stat: TorrentStat::TorrentWorking as i32,
-            stat_string: "Torrent working".to_string(),
-            ..Default::default()
+        .map(|t| t.info_hash.to_lowercase())
+        .collect();
+
+    // Build list from session torrents with metadata
+    let mut torrents: Vec<TorrentStatus> = list
+        .torrents
+        .iter()
+        .map(|t| {
+            let hash_lower = t.info_hash.to_lowercase();
+            let metadata = metadata_store.get(&hash_lower).cloned().unwrap_or_default();
+            TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                name: t.name.clone().unwrap_or_default(),
+                hash: t.info_hash.clone(),
+                stat: TorrentStat::TorrentWorking as i32,
+                stat_string: "Torrent working".to_string(),
+                ..Default::default()
+            }
         })
         .collect();
+
+    // Add torrents that are in metadata store but not yet in session (still resolving)
+    for (hash, metadata) in metadata_store.iter() {
+        if !session_hashes.contains(hash) {
+            torrents.push(TorrentStatus {
+                title: metadata.title.clone(),
+                category: metadata.category.clone(),
+                poster: metadata.poster.clone(),
+                data: metadata.data.clone(),
+                timestamp: metadata.timestamp,
+                name: format!("infohash:{}", hash),
+                hash: hash.clone(),
+                stat: TorrentStat::TorrentGettingInfo as i32,
+                stat_string: "Torrent getting info".to_string(),
+                ..Default::default()
+            });
+        }
+    }
 
     Ok(Json(torrents).into_response())
 }
@@ -355,14 +474,18 @@ async fn torrents_list(state: Arc<AppState>) -> Result<Response, (StatusCode, St
 async fn torrents_wipe(state: Arc<AppState>) -> Result<Response, (StatusCode, String)> {
     let list = state.api.api_torrent_list();
 
-    // Delete each torrent
+    // Delete each torrent from session
     for t in list.torrents {
         if let Some(id) = t.id {
             let _ = state.session.delete(TorrentIdOrHash::Id(id), true).await;
         }
     }
 
-    Ok(Json(serde_json::json!({"status": "ok"})).into_response())
+    // Clear metadata store
+    state.torrent_metadata.write().await.clear();
+
+    // TorrServer returns just HTTP 200 with no body
+    Ok(StatusCode::OK.into_response())
 }
 
 // ============================================================================
@@ -744,7 +867,7 @@ fn get_torrent_info(handle: &librqbit::ManagedTorrent) -> (String, Vec<TorrentFi
                 .enumerate()
                 .filter_map(|(id, f)| {
                     f.filename.to_string().ok().map(|path| TorrentFileStat {
-                        id: id as i32,
+                        id: (id + 1) as i32, // TorrServer uses 1-based IDs (0 is undefined in web UI)
                         path,
                         length: f.len as i64,
                     })
@@ -775,4 +898,108 @@ fn is_media_file(filename: &str) -> bool {
         || lower.ends_with(".aac")
         || lower.ends_with(".ogg")
         || lower.ends_with(".m4a")
+}
+
+/// Monitor hashing/initialization progress for a torrent and log to console
+async fn monitor_hashing_progress(handle: std::sync::Arc<librqbit::ManagedTorrent>, hash: String) {
+    let start = std::time::Instant::now();
+    let mut last_state = String::new();
+    let mut last_progress: u64 = 0;
+
+    loop {
+        let stats = handle.stats();
+        let state = format!("{:?}", stats.state);
+        let progress_bytes = stats.progress_bytes;
+        let total_bytes = stats.total_bytes;
+
+        // Calculate progress percentage
+        let progress_pct = if total_bytes > 0 {
+            (progress_bytes as f64 / total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Log state changes
+        if state != last_state {
+            println!(
+                "[HASH] State changed: hash={}, state={}, progress={:.1}% ({}/{})",
+                hash,
+                state,
+                progress_pct,
+                format_bytes(progress_bytes),
+                format_bytes(total_bytes)
+            );
+            last_state = state.clone();
+        }
+
+        // Log progress updates during initialization (every 10% or significant change)
+        if state == "Initializing" && progress_bytes > last_progress {
+            let last_pct = if total_bytes > 0 {
+                (last_progress as f64 / total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            if progress_pct - last_pct >= 10.0 || progress_bytes - last_progress > 100_000_000 {
+                println!(
+                    "[HASH] Hashing progress: hash={}, {:.1}% ({}/{}), elapsed={:?}",
+                    hash,
+                    progress_pct,
+                    format_bytes(progress_bytes),
+                    format_bytes(total_bytes),
+                    start.elapsed()
+                );
+                last_progress = progress_bytes;
+            }
+        }
+
+        // Log peer info when live
+        if let Some(live) = &stats.live {
+            let peers = live.snapshot.peer_stats.live;
+            let down_speed = live.download_speed.mbps;
+            let up_speed = live.upload_speed.mbps;
+
+            if peers > 0 || down_speed > 0.0 || up_speed > 0.0 {
+                println!(
+                    "[TORRENT] Status: hash={}, peers={}, down={:.2} MiB/s, up={:.2} MiB/s, progress={:.1}%",
+                    hash, peers, down_speed, up_speed, progress_pct
+                );
+            }
+        }
+
+        // Stop monitoring when finished or after timeout
+        if stats.finished {
+            println!(
+                "[HASH] Completed: hash={}, total={}, elapsed={:?}",
+                hash,
+                format_bytes(total_bytes),
+                start.elapsed()
+            );
+            break;
+        }
+
+        // Stop monitoring after 5 minutes to avoid leaking tasks
+        if start.elapsed() > std::time::Duration::from_secs(300) {
+            println!(
+                "[HASH] Monitoring timeout (5min): hash={}, state={}, progress={:.1}%",
+                hash, state, progress_pct
+            );
+            break;
+        }
+
+        // Check every 2 seconds
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GiB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.2} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.2} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
