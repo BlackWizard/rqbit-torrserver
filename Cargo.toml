@@ -1,0 +1,22 @@
+[package]
+name = "rqbit-torrserver"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+librqbit = "8.1.1"
+reqwest = { version = "0.12", features = ["stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
+
+[build-dependencies]
+vergen-gitcl = "1"
+
+[dev-dependencies]
+axum-test = "16.0"
+serde_json = "1.0"
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3.10"
