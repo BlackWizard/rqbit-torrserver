@@ -100,7 +100,10 @@ async fn test_stat_endpoint() {
 
     response.assert_status_ok();
     let text = response.text();
-    assert!(text.contains("Torrents:"), "stat should contain torrent count");
+    assert!(
+        text.contains("Torrents:"),
+        "stat should contain torrent count"
+    );
 }
 
 #[tokio::test]
