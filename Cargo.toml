@@ -11,6 +11,9 @@ reqwest = { version = "0.12", features = ["stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+rust-embed = { version = "8.5", features = ["compression"] }
+mime_guess = "2.0"
 
 [build-dependencies]
 vergen-gitcl = "1"

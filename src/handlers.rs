@@ -1,22 +1,53 @@
 use axum::{
+    Json,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    Json,
 };
 use librqbit::{AddTorrent, api::TorrentIdOrHash};
 use std::sync::Arc;
 
 use crate::models::*;
-use crate::AppState;
+use crate::{AppState, TorrentMetadata};
+
+use rust_embed::RustEmbed;
+
+#[derive(RustEmbed)]
+#[folder = "web/"]
+struct Assets;
 
 /// Parse JSON from body regardless of Content-Type header.
 /// TorrServer clients often send JSON with Content-Type: application/x-www-form-urlencoded
 fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, (StatusCode, String)> {
-    serde_json::from_slice(body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
-    })
+    serde_json::from_slice(body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))
+}
+
+pub async fn static_handler(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+
+    // Default to index.html for root or SPA routing
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(Body::from(content.data))
+                .unwrap()
+        }
+        None => {
+            // Optional: fallback to index.html for SPA routing
+            if path != "index.html" {
+                return Box::pin(static_handler(Uri::from_static("/")))
+                    .await
+                    .into_response();
+            }
+            (StatusCode::NOT_FOUND, "404 Not Found").into_response()
+        }
+    }
 }
 
 // ============================================================================
@@ -58,36 +89,114 @@ async fn torrents_add(
         "link is required for add action".to_string(),
     ))?;
 
-    let add_torrent = AddTorrent::from_url(&link);
-    let response = state
-        .session
-        .add_torrent(add_torrent, None)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Extract hash from magnet link for immediate response
+    let hash = extract_hash(&link);
+    let title = req.title.clone().unwrap_or_default();
+    let poster = req.poster.clone().unwrap_or_default();
+    let category = req.category.clone().unwrap_or_default();
+    let data = req.data.clone().unwrap_or_default();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
 
-    let handle = response.into_handle().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Failed to get torrent handle".to_string(),
-    ))?;
+    // Store metadata for later retrieval
+    {
+        let metadata = TorrentMetadata {
+            title: title.clone(),
+            poster: poster.clone(),
+            category: category.clone(),
+            data: data.clone(),
+            timestamp,
+        };
+        state
+            .torrent_metadata
+            .write()
+            .await
+            .insert(hash.clone(), metadata);
+    }
 
-    let hash = handle.info_hash().as_string();
-    let stats = handle.stats();
-    let (name, file_stats, torrent_size) = get_torrent_info(&handle);
+    // Spawn torrent addition in background so it continues even if we return early
+    let add_torrent = AddTorrent::Url(std::borrow::Cow::Owned(link));
+    let session = state.session.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
 
+    tokio::spawn(async move {
+        let result = session.add_torrent(add_torrent, None).await;
+        if let Err(ref e) = result {
+            eprintln!("Error adding torrent: {}", e);
+        }
+        let _ = tx.send(result);
+    });
+
+    // Wait with timeout for the result
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(Ok(response))) => {
+            if let Some(handle) = response.into_handle() {
+                let hash = handle.info_hash().as_string();
+                let stats = handle.stats();
+                let (name, file_stats, torrent_size) = get_torrent_info(&handle);
+
+                let status = TorrentStatus {
+                    title: title.clone(),
+                    category: category.clone(),
+                    poster: poster.clone(),
+                    data: data.clone(),
+                    timestamp,
+                    name,
+                    hash,
+                    stat: TorrentStat::TorrentWorking as i32,
+                    stat_string: "Torrent working".to_string(),
+                    torrent_size,
+                    download_speed: stats
+                        .live
+                        .as_ref()
+                        .map(|l| l.download_speed.mbps * 125000.0)
+                        .unwrap_or(0.0),
+                    upload_speed: stats
+                        .live
+                        .as_ref()
+                        .map(|l| l.upload_speed.mbps * 125000.0)
+                        .unwrap_or(0.0),
+                    total_peers: stats
+                        .live
+                        .as_ref()
+                        .map(|l| l.snapshot.peer_stats.live as i32)
+                        .unwrap_or(0),
+                    active_peers: stats
+                        .live
+                        .as_ref()
+                        .map(|l| l.snapshot.peer_stats.live as i32)
+                        .unwrap_or(0),
+                    file_stats,
+                    ..Default::default()
+                };
+                return Ok(Json(status).into_response());
+            }
+        }
+        Ok(Ok(Err(e))) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+        Ok(Err(_)) => {
+            // Channel closed - shouldn't happen
+        }
+        Err(_) => {
+            // Timeout - torrent is being added in background, metadata not ready yet
+            // This is expected for magnet links
+        }
+    }
+
+    // Return status indicating torrent is being fetched (addition continues in background)
     let status = TorrentStatus {
+        title: title.clone(),
+        category,
+        poster,
+        data,
+        timestamp,
+        name: format!("infohash:{}", hash),
         hash,
-        name,
-        title: req.title.unwrap_or_default(),
-        poster: req.poster.unwrap_or_default(),
-        category: req.category.unwrap_or_default(),
-        stat: TorrentStat::TorrentWorking as i32,
-        stat_string: "Torrent working".to_string(),
-        torrent_size,
-        download_speed: stats.live.as_ref().map(|l| l.download_speed.mbps * 125000.0).unwrap_or(0.0),
-        upload_speed: stats.live.as_ref().map(|l| l.upload_speed.mbps * 125000.0).unwrap_or(0.0),
-        total_peers: stats.live.as_ref().map(|l| l.snapshot.peer_stats.live as i32).unwrap_or(0),
-        active_peers: stats.live.as_ref().map(|l| l.snapshot.peer_stats.live as i32).unwrap_or(0),
-        file_stats,
+        stat: TorrentStat::TorrentGettingInfo as i32,
+        stat_string: "Torrent getting info".to_string(),
         ..Default::default()
     };
 
@@ -103,31 +212,83 @@ async fn torrents_get(
         "hash is required for get action".to_string(),
     ))?;
 
+    let hash_lower = hash.to_lowercase();
+
+    // Get stored metadata
+    let metadata = state
+        .torrent_metadata
+        .read()
+        .await
+        .get(&hash_lower)
+        .cloned()
+        .unwrap_or_default();
+
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let handle = state.api.mgr_handle(id)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    // Try to get the torrent handle
+    match state.api.mgr_handle(id) {
+        Ok(handle) => {
+            let stats = handle.stats();
+            let hash_str = handle.info_hash().as_string();
+            let (name, file_stats, torrent_size) = get_torrent_info(&handle);
 
-    let stats = handle.stats();
-    let hash_str = handle.info_hash().as_string();
-    let (name, file_stats, torrent_size) = get_torrent_info(&handle);
+            let status = TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                name,
+                hash: hash_str,
+                stat: TorrentStat::TorrentWorking as i32,
+                stat_string: "Torrent working".to_string(),
+                torrent_size,
+                download_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.download_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                upload_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.upload_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                total_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                active_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                file_stats,
+                ..Default::default()
+            };
 
-    let status = TorrentStatus {
-        hash: hash_str,
-        name,
-        stat: TorrentStat::TorrentWorking as i32,
-        stat_string: "Torrent working".to_string(),
-        torrent_size,
-        download_speed: stats.live.as_ref().map(|l| l.download_speed.mbps * 125000.0).unwrap_or(0.0),
-        upload_speed: stats.live.as_ref().map(|l| l.upload_speed.mbps * 125000.0).unwrap_or(0.0),
-        total_peers: stats.live.as_ref().map(|l| l.snapshot.peer_stats.live as i32).unwrap_or(0),
-        active_peers: stats.live.as_ref().map(|l| l.snapshot.peer_stats.live as i32).unwrap_or(0),
-        file_stats,
-        ..Default::default()
-    };
+            Ok(Json(status).into_response())
+        }
+        Err(_) => {
+            // Torrent not found - might still be resolving metadata
+            // Return "getting info" status instead of error (TorrServer compatibility)
+            let status = TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                name: format!("infohash:{}", hash_lower),
+                hash: hash_lower,
+                stat: TorrentStat::TorrentGettingInfo as i32,
+                stat_string: "Torrent getting info".to_string(),
+                ..Default::default()
+            };
 
-    Ok(Json(status).into_response())
+            Ok(Json(status).into_response())
+        }
+    }
 }
 
 async fn torrents_set(
@@ -142,7 +303,9 @@ async fn torrents_set(
     // Verify torrent exists
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let _ = state.api.mgr_handle(id)
+    let _ = state
+        .api
+        .mgr_handle(id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     // In TorrServer, set updates metadata like title/poster/category
@@ -174,15 +337,17 @@ async fn torrents_remove(
 async fn torrents_list(state: Arc<AppState>) -> Result<Response, (StatusCode, String)> {
     let list = state.api.api_torrent_list();
 
-    let torrents: Vec<TorrentStatus> = list.torrents.iter().map(|t| {
-        TorrentStatus {
+    let torrents: Vec<TorrentStatus> = list
+        .torrents
+        .iter()
+        .map(|t| TorrentStatus {
             hash: t.info_hash.clone(),
             name: t.name.clone().unwrap_or_default(),
             stat: TorrentStat::TorrentWorking as i32,
             stat_string: "Torrent working".to_string(),
             ..Default::default()
-        }
-    }).collect();
+        })
+        .collect();
 
     Ok(Json(torrents).into_response())
 }
@@ -230,7 +395,9 @@ async fn stream_stat(
 
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let handle = state.api.mgr_handle(id)
+    let handle = state
+        .api
+        .mgr_handle(id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let stats = handle.stats();
@@ -242,8 +409,16 @@ async fn stream_stat(
         stat: TorrentStat::TorrentWorking as i32,
         stat_string: "Torrent working".to_string(),
         torrent_size,
-        download_speed: stats.live.as_ref().map(|l| l.download_speed.mbps * 125000.0).unwrap_or(0.0),
-        upload_speed: stats.live.as_ref().map(|l| l.upload_speed.mbps * 125000.0).unwrap_or(0.0),
+        download_speed: stats
+            .live
+            .as_ref()
+            .map(|l| l.download_speed.mbps * 125000.0)
+            .unwrap_or(0.0),
+        upload_speed: stats
+            .live
+            .as_ref()
+            .map(|l| l.upload_speed.mbps * 125000.0)
+            .unwrap_or(0.0),
         file_stats,
         ..Default::default()
     };
@@ -260,7 +435,9 @@ async fn stream_m3u(
 
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let handle = state.api.mgr_handle(id)
+    let handle = state
+        .api
+        .mgr_handle(id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let meta = handle.metadata.load();
@@ -429,11 +606,15 @@ pub async fn cache_handler(
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
     let req: CacheRequest = parse_json(&body)?;
-    let hash = req.hash.ok_or((StatusCode::BAD_REQUEST, "hash is required".to_string()))?;
+    let hash = req
+        .hash
+        .ok_or((StatusCode::BAD_REQUEST, "hash is required".to_string()))?;
 
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let handle = state.api.mgr_handle(id)
+    let handle = state
+        .api
+        .mgr_handle(id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let stats = handle.stats();
@@ -445,8 +626,16 @@ pub async fn cache_handler(
         stat: TorrentStat::TorrentWorking as i32,
         stat_string: "Torrent working".to_string(),
         torrent_size,
-        download_speed: stats.live.as_ref().map(|l| l.download_speed.mbps * 125000.0).unwrap_or(0.0),
-        upload_speed: stats.live.as_ref().map(|l| l.upload_speed.mbps * 125000.0).unwrap_or(0.0),
+        download_speed: stats
+            .live
+            .as_ref()
+            .map(|l| l.download_speed.mbps * 125000.0)
+            .unwrap_or(0.0),
+        upload_speed: stats
+            .live
+            .as_ref()
+            .map(|l| l.upload_speed.mbps * 125000.0)
+            .unwrap_or(0.0),
         file_stats,
         ..Default::default()
     };
@@ -480,7 +669,9 @@ pub async fn playlist_handler(
 ) -> Result<Response, (StatusCode, String)> {
     let id = TorrentIdOrHash::try_from(params.hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let handle = state.api.mgr_handle(id)
+    let handle = state
+        .api
+        .mgr_handle(id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let meta = handle.metadata.load();
@@ -538,7 +729,10 @@ fn find_torrent_id_by_hash(
         .iter()
         .find(|t| t.info_hash.to_lowercase() == hash_lower)
         .and_then(|t| t.id)
-        .ok_or((StatusCode::NOT_FOUND, format!("Torrent not found: {}", hash)))
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Torrent not found: {}", hash),
+        ))
 }
 
 fn get_torrent_info(handle: &librqbit::ManagedTorrent) -> (String, Vec<TorrentFileStat>, i64) {
