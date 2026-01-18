@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -10,6 +10,14 @@ use std::sync::Arc;
 
 use crate::models::*;
 use crate::AppState;
+
+/// Parse JSON from body regardless of Content-Type header.
+/// TorrServer clients often send JSON with Content-Type: application/x-www-form-urlencoded
+fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, (StatusCode, String)> {
+    serde_json::from_slice(body).map_err(|e| {
+        (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
+    })
+}
 
 // ============================================================================
 // GET /echo - Returns server version as plain text
@@ -24,8 +32,9 @@ pub async fn echo_handler() -> impl IntoResponse {
 // ============================================================================
 pub async fn torrents_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<TorrentsRequest>,
+    body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
+    let req: TorrentsRequest = parse_json(&body)?;
     match req.action.as_str() {
         "add" => torrents_add(state, req).await,
         "get" => torrents_get(state, req).await,
@@ -351,8 +360,9 @@ pub async fn play_handler(
 // ============================================================================
 pub async fn settings_handler(
     State(_state): State<Arc<AppState>>,
-    Json(req): Json<SettingsRequest>,
+    body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
+    let req: SettingsRequest = parse_json(&body)?;
     match req.action.as_str() {
         "get" => {
             // Return current settings (defaults for now)
@@ -391,8 +401,9 @@ pub async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
 // ============================================================================
 pub async fn viewed_handler(
     State(_state): State<Arc<AppState>>,
-    Json(req): Json<ViewedRequest>,
+    body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
+    let req: ViewedRequest = parse_json(&body)?;
     match req.action.as_str() {
         "list" => {
             // Return empty list (rqbit doesn't track viewed state)
@@ -415,8 +426,9 @@ pub async fn viewed_handler(
 // ============================================================================
 pub async fn cache_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CacheRequest>,
+    body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
+    let req: CacheRequest = parse_json(&body)?;
     let hash = req.hash.ok_or((StatusCode::BAD_REQUEST, "hash is required".to_string()))?;
 
     let id = TorrentIdOrHash::try_from(hash.as_str())
