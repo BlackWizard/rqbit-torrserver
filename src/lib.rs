@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tower_http::cors::{Any, CorsLayer};
-// use tower_http::services::ServeDir;
 
 pub mod handlers;
 pub mod models;
@@ -52,18 +51,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         // Core TorrServer API endpoints
-        .route("/echo", get(crate::handlers::echo_handler))
-        .route("/torrents", post(handlers::torrents_handler))
-        .route("/stream/{*path}", get(handlers::stream_handler))
-        .route("/play/{hash}/{id}", get(handlers::play_handler))
-        .route("/settings", post(handlers::settings_handler))
-        .route("/shutdown", get(handlers::shutdown_handler))
-        .route("/viewed", post(handlers::viewed_handler))
-        .route("/cache", post(handlers::cache_handler))
-        .route("/stat", get(handlers::stat_handler))
-        .route("/playlist", get(handlers::playlist_handler))
-        //.nest_service("/", ServeDir::new("web"))
-        .fallback(handlers::static_handler)
+        .route("/echo", get(self::handlers::echo_handler))
+        .route("/torrents", post(self::handlers::torrents_handler))
+        .route("/stream/{*path}", get(self::handlers::stream_handler))
+        .route("/play/{hash}/{id}", get(self::handlers::play_handler))
+        .route("/settings", post(self::handlers::settings_handler))
+        .route("/shutdown", get(self::handlers::shutdown_handler))
+        .route("/viewed", post(self::handlers::viewed_handler))
+        .route("/cache", post(self::handlers::cache_handler))
+        .route("/stat", get(self::handlers::stat_handler))
+        .route("/playlist", get(self::handlers::playlist_handler))
+        .fallback(self::handlers::static_handler)
         .layer(cors)
         .with_state(state)
 }
