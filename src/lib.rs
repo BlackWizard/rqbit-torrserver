@@ -54,7 +54,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Core TorrServer API endpoints
         .route("/echo", get(handlers::echo_handler))
         .route("/torrents", post(handlers::torrents_handler))
-        .route("/stream/*path", get(handlers::stream_handler))
+        .route("/stream/{*path}", get(handlers::stream_handler))
         .route("/play/{hash}/{id}", get(handlers::play_handler))
         .route("/settings", post(handlers::settings_handler))
         .route("/shutdown", get(handlers::shutdown_handler))
