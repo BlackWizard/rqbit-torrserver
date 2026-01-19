@@ -296,6 +296,7 @@ pub struct Viewed {
 
 /// Piece state for cache
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
 pub struct PieceState {
     pub id: i32,
     pub length: i64,
@@ -306,6 +307,7 @@ pub struct PieceState {
 
 /// Reader state for cache
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
 pub struct ReaderState {
     pub start: i32,
     pub end: i32,
@@ -322,7 +324,6 @@ pub struct CacheState {
     pub pieces_length: i64,
     pub pieces_count: i32,
     pub torrent: Option<TorrentStatus>,
-    pub pieces: std::collections::HashMap<String, PieceState>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pieces: std::collections::BTreeMap<String, PieceState>,
     pub readers: Vec<ReaderState>,
 }

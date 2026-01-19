@@ -7,6 +7,8 @@ use axum::{
 };
 use librqbit::{AddTorrent, AddTorrentOptions, api::TorrentIdOrHash};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio_util::io::ReaderStream;
 
 use crate::models::*;
 use crate::{AppState, TorrentMetadata};
@@ -440,27 +442,68 @@ async fn torrents_list(state: Arc<AppState>) -> Result<Response, (StatusCode, St
         .map(|t| t.info_hash.to_lowercase())
         .collect();
 
-    // Build list from session torrents with metadata
-    let mut torrents: Vec<TorrentStatus> = list
-        .torrents
-        .iter()
-        .map(|t| {
-            let hash_lower = t.info_hash.to_lowercase();
-            let metadata = metadata_store.get(&hash_lower).cloned().unwrap_or_default();
-            TorrentStatus {
-                title: metadata.title,
-                category: metadata.category,
-                poster: metadata.poster,
-                data: metadata.data,
-                timestamp: metadata.timestamp,
-                name: t.name.clone().unwrap_or_default(),
-                hash: t.info_hash.clone(),
-                stat: TorrentStat::TorrentWorking as i32,
-                stat_string: "Torrent working".to_string(),
-                ..Default::default()
-            }
-        })
-        .collect();
+    // Build list from session torrents with metadata and stats
+    let mut torrents: Vec<TorrentStatus> = Vec::new();
+    for t in &list.torrents {
+        let hash_lower = t.info_hash.to_lowercase();
+        let metadata = metadata_store.get(&hash_lower).cloned().unwrap_or_default();
+
+        // Get torrent handle for statistics
+        let (torrent_size, download_speed, upload_speed, total_peers, active_peers, file_stats) =
+            if let Some(id) = t.id {
+                if let Ok(handle) = state.api.mgr_handle(TorrentIdOrHash::Id(id)) {
+                    let stats = handle.stats();
+                    let (_, files, size) = get_torrent_info(&handle);
+                    (
+                        size,
+                        stats
+                            .live
+                            .as_ref()
+                            .map(|l| l.download_speed.mbps * 125000.0)
+                            .unwrap_or(0.0),
+                        stats
+                            .live
+                            .as_ref()
+                            .map(|l| l.upload_speed.mbps * 125000.0)
+                            .unwrap_or(0.0),
+                        stats
+                            .live
+                            .as_ref()
+                            .map(|l| l.snapshot.peer_stats.live as i32)
+                            .unwrap_or(0),
+                        stats
+                            .live
+                            .as_ref()
+                            .map(|l| l.snapshot.peer_stats.live as i32)
+                            .unwrap_or(0),
+                        files,
+                    )
+                } else {
+                    (0, 0.0, 0.0, 0, 0, vec![])
+                }
+            } else {
+                (0, 0.0, 0.0, 0, 0, vec![])
+            };
+
+        torrents.push(TorrentStatus {
+            title: metadata.title,
+            category: metadata.category,
+            poster: metadata.poster,
+            data: metadata.data,
+            timestamp: metadata.timestamp,
+            name: t.name.clone().unwrap_or_default(),
+            hash: t.info_hash.clone(),
+            stat: TorrentStat::TorrentWorking as i32,
+            stat_string: "Torrent working".to_string(),
+            torrent_size,
+            download_speed,
+            upload_speed,
+            total_peers,
+            active_peers,
+            file_stats,
+            ..Default::default()
+        });
+    }
 
     // Add torrents that are in metadata store but not yet in session (still resolving)
     for (hash, metadata) in metadata_store.iter() {
@@ -507,6 +550,7 @@ pub async fn stream_handler(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
     Query(params): Query<StreamQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     // If stat param is present, return torrent status
     if params.stat.is_some() {
@@ -519,7 +563,7 @@ pub async fn stream_handler(
     }
 
     // Otherwise, proxy to rqbit stream
-    stream_content(&state, &params, &path).await
+    stream_content(&state, &params, &path, headers).await
 }
 
 async fn stream_stat(
@@ -558,6 +602,9 @@ async fn stream_stat(
                 stat: TorrentStat::TorrentWorking as i32,
                 stat_string: "Torrent working".to_string(),
                 torrent_size,
+                loaded_size: stats.progress_bytes as i64,
+                preloaded_bytes: stats.progress_bytes as i64,
+                preload_size: (torrent_size as f64 * 0.05) as i64, // 5% preload
                 download_speed: stats
                     .live
                     .as_ref()
@@ -578,6 +625,29 @@ async fn stream_stat(
                     .as_ref()
                     .map(|l| l.snapshot.peer_stats.live as i32)
                     .unwrap_or(0),
+                pending_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.connecting as i32)
+                    .unwrap_or(0),
+                half_open_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.connecting as i32)
+                    .unwrap_or(0),
+                connected_seeders: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.seen as i32)
+                    .unwrap_or(0),
+                bytes_read: stats.progress_bytes as i64,
+                bytes_read_data: stats.progress_bytes as i64,
+                bytes_read_useful_data: stats.progress_bytes as i64,
+                bytes_written: stats.uploaded_bytes as i64,
+                chunks_read: (stats.progress_bytes / 16384) as i64,
+                chunks_read_useful: (stats.progress_bytes / 16384) as i64,
+                chunks_read_wasted: 0,
+                pieces_dirtied_good: calculate_completed_pieces(&handle),
                 file_stats,
                 ..Default::default()
             };
@@ -651,9 +721,20 @@ async fn stream_content(
     state: &Arc<AppState>,
     params: &StreamQuery,
     _path: &str,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let hash = extract_hash(&params.link);
+    let hash_lower = hash.to_lowercase();
     let index = params.index.unwrap_or(0);
+
+    // Get stored metadata
+    let metadata = state
+        .torrent_metadata
+        .read()
+        .await
+        .get(&hash_lower)
+        .cloned()
+        .unwrap_or_default();
 
     // First, try to find the torrent
     let torrent_id = match find_torrent_id_by_hash(&state, &hash) {
@@ -686,14 +767,165 @@ async fn stream_content(
         }
     };
 
-    // Build redirect URL to rqbit's native streaming endpoint
-    let redirect_url = format!("/torrents/{}/stream/{}", torrent_id, index);
+    // Get torrent handle to check preload status
+    let id = TorrentIdOrHash::Id(torrent_id);
+    if let Ok(handle) = state.api.mgr_handle(id) {
+        let stats = handle.stats();
+        let (name, file_stats, torrent_size) = get_torrent_info(&handle);
 
-    Ok(Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, redirect_url)
-        .body(Body::empty())
-        .unwrap())
+        // Calculate preload threshold (5% of file)
+        let preload_size = (torrent_size as f64 * 0.05) as u64;
+
+        // If we haven't downloaded enough for preload, return preload status
+        if stats.progress_bytes < preload_size {
+            let status = TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                hash: hash_lower,
+                name,
+                stat: TorrentStat::TorrentPreload as i32,
+                stat_string: "Torrent preload".to_string(),
+                torrent_size,
+                loaded_size: stats.progress_bytes as i64,
+                preloaded_bytes: stats.progress_bytes as i64,
+                preload_size: preload_size as i64,
+                download_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.download_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                upload_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.upload_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                total_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                active_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                pending_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.connecting as i32)
+                    .unwrap_or(0),
+                half_open_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.connecting as i32)
+                    .unwrap_or(0),
+                connected_seeders: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.seen as i32)
+                    .unwrap_or(0),
+                bytes_read: stats.progress_bytes as i64,
+                bytes_read_data: stats.progress_bytes as i64,
+                bytes_read_useful_data: stats.progress_bytes as i64,
+                bytes_written: stats.uploaded_bytes as i64,
+                chunks_read: (stats.progress_bytes / 16384) as i64,
+                chunks_read_useful: (stats.progress_bytes / 16384) as i64,
+                chunks_read_wasted: 0,
+                pieces_dirtied_good: calculate_completed_pieces(&handle),
+                file_stats,
+                ..Default::default()
+            };
+
+            return Ok(Json(status).into_response());
+        }
+    }
+
+    // Preload complete - stream directly from librqbit
+    // Convert from 1-based index (TorrServer) to 0-based index (rqbit)
+    let rqbit_index = if index > 0 { index - 1 } else { 0 };
+
+    // Get file stream directly from librqbit
+    let mut file_stream = state
+        .api
+        .api_stream(TorrentIdOrHash::Id(torrent_id), rqbit_index)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Trigger sequential loading from the beginning by reading a small chunk
+    // This ensures the torrent starts downloading from the first pieces
+    let mut preload_buf = vec![0u8; 4096];
+    let _ = file_stream.read(&mut preload_buf).await;
+
+    // Reset to beginning for actual streaming
+    use tokio::io::AsyncSeekExt;
+    let _ = file_stream.seek(std::io::SeekFrom::Start(0)).await;
+
+    // Get file info for content type and size
+    let handle = state
+        .api
+        .mgr_handle(TorrentIdOrHash::Id(torrent_id))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (filename, file_length) = if let Some(meta) = &*handle.metadata.load() {
+        if let Ok(mut files) = meta.info.iter_file_details() {
+            if let Some(f) = files.nth(rqbit_index) {
+                (
+                    f.filename
+                        .to_string()
+                        .ok()
+                        .unwrap_or_else(|| "video.mkv".to_string()),
+                    f.len,
+                )
+            } else {
+                ("video.mkv".to_string(), 0)
+            }
+        } else {
+            ("video.mkv".to_string(), 0)
+        }
+    } else {
+        ("video.mkv".to_string(), 0)
+    };
+
+    // Determine content type from filename
+    let content_type = mime_guess::from_path(&filename)
+        .first_or_octet_stream()
+        .to_string();
+
+    // Check for Range header
+    let range_header = headers.get(header::RANGE).and_then(|h| h.to_str().ok());
+
+    if let Some((start, end)) = parse_range_header(range_header, file_length) {
+        // Seek to the requested position
+        use tokio::io::AsyncSeekExt;
+        file_stream
+            .seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let content_length = end - start + 1;
+        let content_range = format!("bytes {}-{}/{}", start, end, file_length);
+
+        // Return 206 Partial Content
+        Ok(Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, content_length.to_string())
+            .header(header::CONTENT_RANGE, content_range)
+            .header("Accept-Ranges", "bytes")
+            .body(Body::from_stream(ReaderStream::new(file_stream)))
+            .unwrap())
+    } else {
+        // Stream the full file
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, file_length.to_string())
+            .header("Accept-Ranges", "bytes")
+            .body(Body::from_stream(ReaderStream::new(file_stream)))
+            .unwrap())
+    }
 }
 
 // ============================================================================
@@ -702,17 +934,93 @@ async fn stream_content(
 pub async fn play_handler(
     State(state): State<Arc<AppState>>,
     Path((hash, file_id)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let torrent_id = find_torrent_id_by_hash(&state, &hash)?;
 
-    // Redirect to rqbit's native stream endpoint
-    let redirect_url = format!("/torrents/{}/stream/{}", torrent_id, file_id);
+    // Stream directly from librqbit
+    // Convert from 1-based index (TorrServer) to 0-based index (rqbit)
+    let rqbit_index = if file_id > 0 { file_id - 1 } else { 0 };
 
-    Ok(Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, redirect_url)
-        .body(Body::empty())
-        .unwrap())
+    // Get file stream directly from librqbit
+    let mut file_stream = state
+        .api
+        .api_stream(TorrentIdOrHash::Id(torrent_id), rqbit_index)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Trigger sequential loading from the beginning by reading a small chunk
+    // This ensures the torrent starts downloading from the first pieces
+    let mut preload_buf = vec![0u8; 4096];
+    let _ = file_stream.read(&mut preload_buf).await;
+
+    // Reset to beginning for actual streaming
+    use tokio::io::AsyncSeekExt;
+    let _ = file_stream.seek(std::io::SeekFrom::Start(0)).await;
+
+    // Get file info for content type and size
+    let handle = state
+        .api
+        .mgr_handle(TorrentIdOrHash::Id(torrent_id))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (filename, file_length) = if let Some(meta) = &*handle.metadata.load() {
+        if let Ok(mut files) = meta.info.iter_file_details() {
+            if let Some(f) = files.nth(rqbit_index) {
+                (
+                    f.filename
+                        .to_string()
+                        .ok()
+                        .unwrap_or_else(|| "video.mkv".to_string()),
+                    f.len,
+                )
+            } else {
+                ("video.mkv".to_string(), 0)
+            }
+        } else {
+            ("video.mkv".to_string(), 0)
+        }
+    } else {
+        ("video.mkv".to_string(), 0)
+    };
+
+    // Determine content type from filename
+    let content_type = mime_guess::from_path(&filename)
+        .first_or_octet_stream()
+        .to_string();
+
+    // Check for Range header
+    let range_header = headers.get(header::RANGE).and_then(|h| h.to_str().ok());
+
+    if let Some((start, end)) = parse_range_header(range_header, file_length) {
+        // Seek to the requested position
+        use tokio::io::AsyncSeekExt;
+        file_stream
+            .seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let content_length = end - start + 1;
+        let content_range = format!("bytes {}-{}/{}", start, end, file_length);
+
+        // Return 206 Partial Content
+        Ok(Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, content_length.to_string())
+            .header(header::CONTENT_RANGE, content_range)
+            .header("Accept-Ranges", "bytes")
+            .body(Body::from_stream(ReaderStream::new(file_stream)))
+            .unwrap())
+    } else {
+        // Stream the full file
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, file_length.to_string())
+            .header("Accept-Ranges", "bytes")
+            .body(Body::from_stream(ReaderStream::new(file_stream)))
+            .unwrap())
+    }
 }
 
 // ============================================================================
@@ -813,6 +1121,153 @@ pub async fn cache_handler(
             let stats = handle.stats();
             let (name, file_stats, torrent_size) = get_torrent_info(&handle);
 
+            // Get real piece availability from chunk tracker
+            let (pieces_count, pieces_length, pieces, completed_pieces_count) = if let Some(meta) =
+                &*handle.metadata.load()
+            {
+                let piece_length = meta.lengths.default_piece_length() as u64;
+                let num_pieces = meta.lengths.total_pieces() as i32;
+
+                // Calculate piece availability based on file progress
+                // Use per-file progress to determine which pieces have been downloaded
+                let mut piece_availability = vec![false; num_pieces as usize];
+
+                if let Ok(files) = meta.info.iter_file_details() {
+                    let mut torrent_offset = 0u64;
+
+                    for (file_idx, file) in files.enumerate() {
+                        let file_progress = stats.file_progress.get(file_idx).copied().unwrap_or(0);
+
+                        if file_progress > 0 {
+                            // Calculate which pieces overlap with this file's downloaded bytes
+                            let file_start = torrent_offset;
+                            let file_downloaded_end = file_start + file_progress;
+
+                            // Find first and last piece that contain downloaded data
+                            let first_piece = (file_start / piece_length) as usize;
+                            let last_piece =
+                                ((file_downloaded_end.saturating_sub(1)) / piece_length) as usize;
+
+                            // Mark all complete pieces as available
+                            for piece_idx in first_piece..=last_piece.min(num_pieces as usize - 1) {
+                                let piece_start = piece_idx as u64 * piece_length;
+                                let piece_end = ((piece_idx + 1) as u64 * piece_length)
+                                    .min(meta.lengths.total_length());
+
+                                // A piece is complete if all its bytes are within downloaded range
+                                if piece_start >= file_start && piece_end <= file_downloaded_end {
+                                    piece_availability[piece_idx] = true;
+                                }
+                                // Also mark complete if we've downloaded enough bytes to cover this piece
+                                else if file_downloaded_end >= piece_end {
+                                    piece_availability[piece_idx] = true;
+                                }
+                            }
+                        }
+
+                        torrent_offset += file.len;
+                    }
+                }
+
+                // Build pieces map with completion and partial download info
+                // Calculate downloaded bytes per piece to show partial completion
+                let mut piece_downloaded_bytes: Vec<u64> = vec![0; num_pieces as usize];
+
+                if let Ok(files) = meta.info.iter_file_details() {
+                    let mut torrent_offset = 0u64;
+
+                    for (file_idx, file) in files.enumerate() {
+                        let file_progress = stats.file_progress.get(file_idx).copied().unwrap_or(0);
+
+                        if file_progress > 0 {
+                            let file_start = torrent_offset;
+                            let file_downloaded_end = file_start + file_progress;
+
+                            // Calculate downloaded bytes for each piece this file overlaps
+                            let first_piece = (file_start / piece_length) as usize;
+                            let last_piece =
+                                ((file_downloaded_end.saturating_sub(1)) / piece_length) as usize;
+
+                            for piece_idx in first_piece..=last_piece.min(num_pieces as usize - 1) {
+                                let piece_start = piece_idx as u64 * piece_length;
+                                let piece_end = ((piece_idx + 1) as u64 * piece_length)
+                                    .min(meta.lengths.total_length());
+
+                                // Calculate overlap between downloaded range and this piece
+                                let overlap_start = piece_start.max(file_start);
+                                let overlap_end = piece_end.min(file_downloaded_end);
+
+                                if overlap_end > overlap_start {
+                                    piece_downloaded_bytes[piece_idx] +=
+                                        overlap_end - overlap_start;
+                                }
+                            }
+                        }
+
+                        torrent_offset += file.len;
+                    }
+                }
+
+                // Build pieces map - include completed and partially completed pieces
+                let mut pieces_map: std::collections::BTreeMap<String, PieceState> =
+                    std::collections::BTreeMap::new();
+                let mut completed_count = 0i64;
+
+                for i in 0..num_pieces {
+                    let actual_piece_length = if i == num_pieces - 1 {
+                        let total_len = meta.lengths.total_length();
+                        (total_len - (piece_length * (num_pieces - 1) as u64)) as i64
+                    } else {
+                        piece_length as i64
+                    };
+
+                    let downloaded =
+                        piece_downloaded_bytes.get(i as usize).copied().unwrap_or(0) as i64;
+                    let is_completed = downloaded >= actual_piece_length;
+
+                    // Include piece if it has any downloaded data
+                    if downloaded > 0 {
+                        if is_completed {
+                            completed_count += 1;
+                        }
+
+                        // Set priority based on piece state
+                        // Priority scale: 0 (no priority), 1-10 (downloading/partial), 11+ (being streamed)
+                        let priority = if is_completed {
+                            0 // Completed pieces have no priority
+                        } else {
+                            // Partial pieces get higher priority
+                            // Higher priority for pieces with more data (actively downloading)
+                            let completion_pct =
+                                (downloaded as f64 / actual_piece_length as f64 * 100.0) as i32;
+                            if completion_pct > 50 {
+                                10 // High priority - more than half downloaded
+                            } else if completion_pct > 10 {
+                                5 // Medium priority
+                            } else {
+                                1 // Low priority - just started
+                            }
+                        };
+
+                        pieces_map.insert(
+                            i.to_string(), // 0-based piece numbering
+                            PieceState {
+                                id: i,
+                                length: actual_piece_length,
+                                size: downloaded, // Actual downloaded bytes
+                                completed: is_completed,
+                                priority,
+                            },
+                        );
+                    }
+                }
+
+                (num_pieces, piece_length as i64, pieces_map, completed_count)
+            } else {
+                (0, 0, std::collections::BTreeMap::new(), 0)
+            };
+
+            // Now build the status with real piece count
             let status = TorrentStatus {
                 title: metadata.title,
                 category: metadata.category,
@@ -824,6 +1279,9 @@ pub async fn cache_handler(
                 stat: TorrentStat::TorrentWorking as i32,
                 stat_string: "Torrent working".to_string(),
                 torrent_size,
+                loaded_size: stats.progress_bytes as i64,
+                preloaded_bytes: stats.progress_bytes as i64,
+                preload_size: (torrent_size as f64 * 0.05) as i64, // 5% preload
                 download_speed: stats
                     .live
                     .as_ref()
@@ -844,33 +1302,31 @@ pub async fn cache_handler(
                     .as_ref()
                     .map(|l| l.snapshot.peer_stats.live as i32)
                     .unwrap_or(0),
+                pending_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.connecting as i32)
+                    .unwrap_or(0),
+                half_open_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.connecting as i32)
+                    .unwrap_or(0),
+                connected_seeders: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.seen as i32)
+                    .unwrap_or(0),
+                bytes_read: stats.progress_bytes as i64,
+                bytes_read_data: stats.progress_bytes as i64,
+                bytes_read_useful_data: stats.progress_bytes as i64,
+                bytes_written: stats.uploaded_bytes as i64,
+                chunks_read: (stats.progress_bytes / 16384) as i64,
+                chunks_read_useful: (stats.progress_bytes / 16384) as i64,
+                chunks_read_wasted: 0,
+                pieces_dirtied_good: completed_pieces_count, // Real completed pieces count
                 file_stats,
                 ..Default::default()
-            };
-
-            // Get piece information from metadata
-            let (pieces_count, pieces_length, pieces) = if let Some(meta) = &*handle.metadata.load()
-            {
-                let piece_length = meta.lengths.default_piece_length() as i64;
-                let num_pieces = meta.lengths.total_pieces() as i32;
-
-                // Build pieces map - for streaming we show pieces as available
-                let mut pieces_map = std::collections::HashMap::new();
-                for i in 0..num_pieces {
-                    pieces_map.insert(
-                        i.to_string(),
-                        PieceState {
-                            id: i,
-                            length: piece_length,
-                            size: piece_length,
-                            completed: true, // Mark as completed since librqbit handles streaming
-                            priority: 0,
-                        },
-                    );
-                }
-                (num_pieces, piece_length, pieces_map)
-            } else {
-                (0, 0, std::collections::HashMap::new())
             };
 
             let cache_state = CacheState {
@@ -909,7 +1365,7 @@ pub async fn cache_handler(
                 pieces_count: 0,
                 pieces_length: 0,
                 torrent: Some(status),
-                pieces: std::collections::HashMap::new(), // Empty but defined
+                pieces: std::collections::BTreeMap::new(), // Empty but defined
                 readers: vec![],
             };
 
@@ -971,6 +1427,52 @@ pub async fn playlist_handler(
 // Helper functions
 // ============================================================================
 
+/// Calculate accurate completed piece count from file progress
+fn calculate_completed_pieces(handle: &librqbit::ManagedTorrent) -> i64 {
+    if let Some(meta) = &*handle.metadata.load() {
+        let stats = handle.stats();
+        let piece_length = meta.lengths.default_piece_length() as u64;
+        let num_pieces = meta.lengths.total_pieces() as usize;
+
+        let mut piece_availability = vec![false; num_pieces];
+
+        if let Ok(files) = meta.info.iter_file_details() {
+            let mut torrent_offset = 0u64;
+
+            for (file_idx, file) in files.enumerate() {
+                let file_progress = stats.file_progress.get(file_idx).copied().unwrap_or(0);
+
+                if file_progress > 0 {
+                    let file_start = torrent_offset;
+                    let file_downloaded_end = file_start + file_progress;
+
+                    let first_piece = (file_start / piece_length) as usize;
+                    let last_piece =
+                        ((file_downloaded_end.saturating_sub(1)) / piece_length) as usize;
+
+                    for piece_idx in first_piece..=last_piece.min(num_pieces - 1) {
+                        let piece_start = piece_idx as u64 * piece_length;
+                        let piece_end = ((piece_idx + 1) as u64 * piece_length)
+                            .min(meta.lengths.total_length());
+
+                        if piece_start >= file_start && piece_end <= file_downloaded_end {
+                            piece_availability[piece_idx] = true;
+                        } else if file_downloaded_end >= piece_end {
+                            piece_availability[piece_idx] = true;
+                        }
+                    }
+                }
+
+                torrent_offset += file.len;
+            }
+        }
+
+        piece_availability.iter().filter(|&&x| x).count() as i64
+    } else {
+        0
+    }
+}
+
 fn extract_hash(link: &str) -> String {
     if link.starts_with("magnet:") {
         // Extract hash from magnet link
@@ -1001,6 +1503,36 @@ fn extract_trackers(link: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn parse_range_header(range_header: Option<&str>, file_size: u64) -> Option<(u64, u64)> {
+    range_header?;
+    let range = range_header.unwrap();
+
+    // Parse "bytes=start-end" format
+    if !range.starts_with("bytes=") {
+        return None;
+    }
+
+    let range = &range[6..]; // Skip "bytes="
+    let parts: Vec<&str> = range.split('-').collect();
+
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let start = parts[0].parse::<u64>().ok()?;
+    let end = if parts[1].is_empty() {
+        file_size - 1
+    } else {
+        parts[1].parse::<u64>().ok()?.min(file_size - 1)
+    };
+
+    if start <= end && start < file_size {
+        Some((start, end))
+    } else {
+        None
+    }
 }
 
 fn find_torrent_id_by_hash(
@@ -1186,19 +1718,24 @@ pub struct AnnounceQuery {
     pub no_peer_id: Option<u8>,
 }
 
-
 pub async fn announce_handler(
     State(_state): State<Arc<AppState>>,
     Query(params): Query<AnnounceQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    println!("[RETRACKER] Announce request: info_hash={}", params.info_hash);
+    println!(
+        "[RETRACKER] Announce request: info_hash={}",
+        params.info_hash
+    );
 
     // Parse info_hash (URL-encoded 20 bytes)
     let info_hash_bytes = urlencoding::decode_binary(params.info_hash.as_bytes());
     if info_hash_bytes.len() != 20 {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("Invalid info_hash length: {} (expected 20)", info_hash_bytes.len()),
+            format!(
+                "Invalid info_hash length: {} (expected 20)",
+                info_hash_bytes.len()
+            ),
         ));
     }
     let mut info_hash_array = [0u8; 20];
@@ -1209,7 +1746,10 @@ pub async fn announce_handler(
     if peer_id_bytes.len() != 20 {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("Invalid peer_id length: {} (expected 20)", peer_id_bytes.len()),
+            format!(
+                "Invalid peer_id length: {} (expected 20)",
+                peer_id_bytes.len()
+            ),
         ));
     }
     let mut peer_id_array = [0u8; 20];
@@ -1226,7 +1766,10 @@ pub async fn announce_handler(
     // Define fallback trackers
     let trackers = [
         ("opentor.org:2710", "udp://opentor.org:2710"),
-        ("tracker.opentrackr.org:1337", "udp://tracker.opentrackr.org:1337"),
+        (
+            "tracker.opentrackr.org:1337",
+            "udp://tracker.opentrackr.org:1337",
+        ),
         ("open.stealth.si:80", "udp://open.stealth.si:80"),
     ];
 
@@ -1271,7 +1814,11 @@ pub async fn announce_handler(
         match result {
             Ok(peers) => {
                 if !peers.is_empty() {
-                    println!("[RETRACKER] Received {} peers from {}", peers.len(), tracker_url);
+                    println!(
+                        "[RETRACKER] Received {} peers from {}",
+                        peers.len(),
+                        tracker_url
+                    );
                     for peer_addr in &peers {
                         println!("[RETRACKER]   Peer: {}", peer_addr);
                     }

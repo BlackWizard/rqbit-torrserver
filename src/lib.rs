@@ -1,5 +1,7 @@
 use axum::{
     Router,
+    body::Body,
+    http::{Request, Response, header::HeaderValue},
     routing::{get, post},
 };
 use librqbit::{Api, Session};
@@ -43,12 +45,30 @@ impl AppState {
     }
 }
 
+/// Middleware to add Access-Control-Allow-Private-Network header for Chrome
+async fn add_private_network_header(
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response<Body> {
+    let mut response = next.run(request).await;
+
+    // Add the private network access header
+    response.headers_mut().insert(
+        "Access-Control-Allow-Private-Network",
+        HeaderValue::from_static("true"),
+    );
+
+    response
+}
+
 /// Create the TorrServer-compatible router
 pub fn create_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .expose_headers(Any)
+        .max_age(std::time::Duration::from_secs(3600));
 
     Router::new()
         // Core TorrServer API endpoints
@@ -66,6 +86,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/announce", get(self::handlers::announce_handler))
         .fallback(self::handlers::static_handler)
         .layer(cors)
+        .layer(axum::middleware::from_fn(add_private_network_header))
         .with_state(state)
 }
 
