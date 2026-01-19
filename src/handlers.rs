@@ -1223,76 +1223,112 @@ pub async fn announce_handler(
         _ => 0,                      // EVENT_NONE
     };
 
-    println!("[RETRACKER] Contacting UDP tracker: udp://opentor.org:2710");
+    // Define fallback trackers
+    let trackers = [
+        ("opentor.org:2710", "udp://opentor.org:2710"),
+        ("tracker.opentrackr.org:1337", "udp://tracker.opentrackr.org:1337"),
+        ("open.stealth.si:80", "udp://open.stealth.si:80"),
+    ];
 
-    // Resolve opentor.org to IP address
-    let tracker_addr = match tokio::net::lookup_host("opentor.org:2710").await {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => {
-                println!("[RETRACKER] Resolved opentor.org to {}", addr);
-                addr
+    let mut all_peers = Vec::new();
+    let mut successful_trackers = Vec::new();
+
+    // Try each tracker in sequence
+    for (host, tracker_url) in &trackers {
+        println!("[RETRACKER] Trying tracker: {}", tracker_url);
+
+        // Resolve tracker hostname to IP address
+        let tracker_addr = match tokio::net::lookup_host(host).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => {
+                    println!("[RETRACKER] Resolved {} to {}", host, addr);
+                    addr
+                }
+                None => {
+                    println!("[RETRACKER] DNS lookup returned no addresses for {}", host);
+                    continue; // Try next tracker
+                }
+            },
+            Err(e) => {
+                println!("[RETRACKER] DNS lookup failed for {}: {}", host, e);
+                continue; // Try next tracker
             }
-            None => {
-                println!("[RETRACKER] DNS lookup returned no addresses");
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    "Could not resolve opentor.org".to_string(),
-                ));
-            }
-        },
-        Err(e) => {
-            println!("[RETRACKER] DNS lookup failed: {}", e);
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!("DNS lookup failed: {}", e),
-            ));
-        }
-    };
+        };
 
-    // Make UDP tracker announce request using the peer_id from params
-    let result = crate::udp_tracker::announce_to_udp_tracker(
-        tracker_addr,
-        info_hash_array,
-        peer_id_array,
-        params.port,
-        params.uploaded,
-        params.downloaded,
-        params.left,
-        event,
-    )
-    .await;
+        // Make UDP tracker announce request
+        let result = crate::udp_tracker::announce_to_udp_tracker(
+            tracker_addr,
+            info_hash_array,
+            peer_id_array,
+            params.port,
+            params.uploaded,
+            params.downloaded,
+            params.left,
+            event,
+        )
+        .await;
 
-    match result {
-        Ok(peers) => {
-            println!("[RETRACKER] Received {} peers from opentor.org", peers.len());
-            for peer_addr in &peers {
-                println!("[RETRACKER]   Peer: {}", peer_addr);
-            }
+        match result {
+            Ok(peers) => {
+                if !peers.is_empty() {
+                    println!("[RETRACKER] Received {} peers from {}", peers.len(), tracker_url);
+                    for peer_addr in &peers {
+                        println!("[RETRACKER]   Peer: {}", peer_addr);
+                    }
 
-            // Build a simple text response with peer list
-            let mut response_text = format!("d8:intervali1800e5:peers{}:", peers.len() * 6);
-            let mut peers_bytes = Vec::new();
-            for peer_addr in &peers {
-                if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
-                    peers_bytes.extend_from_slice(&ipv4.octets());
-                    peers_bytes.extend_from_slice(&peer_addr.port().to_be_bytes());
+                    // Add unique peers to the collection
+                    for peer in peers {
+                        if !all_peers.contains(&peer) {
+                            all_peers.push(peer);
+                        }
+                    }
+
+                    successful_trackers.push(tracker_url);
+
+                    // If we got peers, we can stop trying other trackers
+                    // (remove this break if you want to query all trackers)
+                    break;
+                } else {
+                    println!("[RETRACKER] No peers returned from {}", tracker_url);
                 }
             }
-            response_text.push_str(&String::from_utf8_lossy(&peers_bytes));
-            response_text.push('e');
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(response_text))
-                .unwrap())
-        }
-        Err(e) => {
-            println!("[RETRACKER] UDP tracker announce failed: {}", e);
-            Err((
-                StatusCode::BAD_GATEWAY,
-                format!("UDP tracker announce failed: {}", e),
-            ))
+            Err(e) => {
+                println!("[RETRACKER] Tracker {} failed: {}", tracker_url, e);
+                continue; // Try next tracker
+            }
         }
     }
+
+    // Check if we got any peers
+    if all_peers.is_empty() {
+        println!("[RETRACKER] No peers found from any tracker");
+        return Err((
+            StatusCode::NOT_FOUND,
+            "No peers found from any tracker".to_string(),
+        ));
+    }
+
+    println!(
+        "[RETRACKER] Total unique peers: {} from {} tracker(s)",
+        all_peers.len(),
+        successful_trackers.len()
+    );
+
+    // Build a bencode response with peer list
+    let mut response_text = format!("d8:intervali1800e5:peers{}:", all_peers.len() * 6);
+    let mut peers_bytes = Vec::new();
+    for peer_addr in &all_peers {
+        if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
+            peers_bytes.extend_from_slice(&ipv4.octets());
+            peers_bytes.extend_from_slice(&peer_addr.port().to_be_bytes());
+        }
+    }
+    response_text.push_str(&String::from_utf8_lossy(&peers_bytes));
+    response_text.push('e');
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(response_text))
+        .unwrap())
 }
