@@ -113,11 +113,21 @@ pub struct TorrentFileStat {
     pub length: i64,
 }
 
-fn is_zero_i64(v: &i64) -> bool { *v == 0 }
-fn is_zero_i32(v: &i32) -> bool { *v == 0 }
-fn is_zero_f64(v: &f64) -> bool { *v == 0.0 }
-fn is_empty_string(v: &String) -> bool { v.is_empty() }
-fn is_empty_vec<T>(v: &Vec<T>) -> bool { v.is_empty() }
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+fn is_empty_string(v: &String) -> bool {
+    v.is_empty()
+}
+fn is_empty_vec<T>(v: &Vec<T>) -> bool {
+    v.is_empty()
+}
 
 /// Full torrent status response
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -284,14 +294,35 @@ pub struct Viewed {
     pub file_index: i32,
 }
 
+/// Piece state for cache
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PieceState {
+    pub id: i32,
+    pub length: i64,
+    pub size: i64,
+    pub completed: bool,
+    pub priority: i32,
+}
+
+/// Reader state for cache
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReaderState {
+    pub start: i32,
+    pub end: i32,
+    pub reader: i32,
+}
+
 /// Cache state response
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "PascalCase")]
 pub struct CacheState {
     pub hash: String,
     pub capacity: i64,
     pub filled: i64,
-    pub pieces_count: i32,
     pub pieces_length: i64,
+    pub pieces_count: i32,
     pub torrent: Option<TorrentStatus>,
+    pub pieces: std::collections::HashMap<String, PieceState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readers: Vec<ReaderState>,
 }

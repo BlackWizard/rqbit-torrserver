@@ -10,6 +10,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 pub mod handlers;
 pub mod models;
+pub mod udp_tracker;
 
 /// Stored metadata for a torrent (from add request)
 #[derive(Clone, Default)]
@@ -61,6 +62,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/cache", post(self::handlers::cache_handler))
         .route("/stat", get(self::handlers::stat_handler))
         .route("/playlist", get(self::handlers::playlist_handler))
+        // Retracker endpoint - fetches peers from opentor.org
+        .route("/announce", get(self::handlers::announce_handler))
         .fallback(self::handlers::static_handler)
         .layer(cors)
         .with_state(state)

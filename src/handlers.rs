@@ -5,13 +5,14 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use librqbit::{AddTorrent, api::TorrentIdOrHash};
+use librqbit::{AddTorrent, AddTorrentOptions, api::TorrentIdOrHash};
 use std::sync::Arc;
 
 use crate::models::*;
 use crate::{AppState, TorrentMetadata};
 
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 
 #[derive(RustEmbed)]
 #[folder = "web/"]
@@ -118,17 +119,28 @@ async fn torrents_add(
 
     // Spawn torrent addition in background so it continues even if we return early
     let add_torrent = AddTorrent::Url(std::borrow::Cow::Owned(link.clone()));
+    let add_opts = Some(AddTorrentOptions {
+        overwrite: true, // Allow overwriting existing files
+        ..Default::default()
+    });
     let session = state.session.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    println!("[DHT] Adding torrent: hash={}", hash);
-    println!("[DHT] Link: {}", link);
+    // Log torrent addition with tracker info
+    let trackers = extract_trackers(&link);
+    println!("[ADD] Adding torrent: hash={}", hash);
+    if !trackers.is_empty() {
+        println!("[ADD] Trackers ({}):", trackers.len());
+        for tracker in &trackers {
+            println!("[ADD]   {}", tracker);
+        }
+    }
 
     let hash_for_log = hash.clone();
     tokio::spawn(async move {
         println!("[DHT] Starting DHT lookup for hash={}", hash_for_log);
         let start = std::time::Instant::now();
-        let result = session.add_torrent(add_torrent, None).await;
+        let result = session.add_torrent(add_torrent, add_opts).await;
         let elapsed = start.elapsed();
         match &result {
             Ok(librqbit::AddTorrentResponse::Added(id, handle)) => {
@@ -515,38 +527,82 @@ async fn stream_stat(
     params: &StreamQuery,
 ) -> Result<Response, (StatusCode, String)> {
     let hash = extract_hash(&params.link);
+    let hash_lower = hash.to_lowercase();
+
+    // Get stored metadata
+    let metadata = state
+        .torrent_metadata
+        .read()
+        .await
+        .get(&hash_lower)
+        .cloned()
+        .unwrap_or_default();
 
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let handle = state
-        .api
-        .mgr_handle(id)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    let stats = handle.stats();
-    let (name, file_stats, torrent_size) = get_torrent_info(&handle);
+    // Try to get the torrent handle
+    match state.api.mgr_handle(id) {
+        Ok(handle) => {
+            let stats = handle.stats();
+            let (name, file_stats, torrent_size) = get_torrent_info(&handle);
 
-    let status = TorrentStatus {
-        hash,
-        name,
-        stat: TorrentStat::TorrentWorking as i32,
-        stat_string: "Torrent working".to_string(),
-        torrent_size,
-        download_speed: stats
-            .live
-            .as_ref()
-            .map(|l| l.download_speed.mbps * 125000.0)
-            .unwrap_or(0.0),
-        upload_speed: stats
-            .live
-            .as_ref()
-            .map(|l| l.upload_speed.mbps * 125000.0)
-            .unwrap_or(0.0),
-        file_stats,
-        ..Default::default()
-    };
+            let status = TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                hash: hash_lower,
+                name,
+                stat: TorrentStat::TorrentWorking as i32,
+                stat_string: "Torrent working".to_string(),
+                torrent_size,
+                download_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.download_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                upload_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.upload_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                total_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                active_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                file_stats,
+                ..Default::default()
+            };
 
-    Ok(Json(status).into_response())
+            Ok(Json(status).into_response())
+        }
+        Err(_) => {
+            // Torrent not found in session - might still be resolving
+            // Return "getting info" status (TorrServer compatibility)
+            let status = TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                name: format!("infohash:{}", hash_lower),
+                hash: hash_lower,
+                stat: TorrentStat::TorrentGettingInfo as i32,
+                stat_string: "Torrent getting info".to_string(),
+                ..Default::default()
+            };
+
+            Ok(Json(status).into_response())
+        }
+    }
 }
 
 async fn stream_m3u(
@@ -611,9 +667,13 @@ async fn stream_content(
             };
 
             let add_torrent = AddTorrent::from_url(&magnet);
+            let add_opts = Some(AddTorrentOptions {
+                overwrite: true,
+                ..Default::default()
+            });
             let response = state
                 .session
-                .add_torrent(add_torrent, None)
+                .add_torrent(add_torrent, add_opts)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -733,46 +793,129 @@ pub async fn cache_handler(
         .hash
         .ok_or((StatusCode::BAD_REQUEST, "hash is required".to_string()))?;
 
+    let hash_lower = hash.to_lowercase();
+
+    // Get stored metadata
+    let metadata = state
+        .torrent_metadata
+        .read()
+        .await
+        .get(&hash_lower)
+        .cloned()
+        .unwrap_or_default();
+
     let id = TorrentIdOrHash::try_from(hash.as_str())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let handle = state
-        .api
-        .mgr_handle(id)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    let stats = handle.stats();
-    let (name, file_stats, torrent_size) = get_torrent_info(&handle);
+    // Try to get the torrent handle
+    match state.api.mgr_handle(id) {
+        Ok(handle) => {
+            let stats = handle.stats();
+            let (name, file_stats, torrent_size) = get_torrent_info(&handle);
 
-    let status = TorrentStatus {
-        hash: hash.clone(),
-        name,
-        stat: TorrentStat::TorrentWorking as i32,
-        stat_string: "Torrent working".to_string(),
-        torrent_size,
-        download_speed: stats
-            .live
-            .as_ref()
-            .map(|l| l.download_speed.mbps * 125000.0)
-            .unwrap_or(0.0),
-        upload_speed: stats
-            .live
-            .as_ref()
-            .map(|l| l.upload_speed.mbps * 125000.0)
-            .unwrap_or(0.0),
-        file_stats,
-        ..Default::default()
-    };
+            let status = TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                hash: hash_lower.clone(),
+                name,
+                stat: TorrentStat::TorrentWorking as i32,
+                stat_string: "Torrent working".to_string(),
+                torrent_size,
+                download_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.download_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                upload_speed: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.upload_speed.mbps * 125000.0)
+                    .unwrap_or(0.0),
+                total_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                active_peers: stats
+                    .live
+                    .as_ref()
+                    .map(|l| l.snapshot.peer_stats.live as i32)
+                    .unwrap_or(0),
+                file_stats,
+                ..Default::default()
+            };
 
-    let cache_state = CacheState {
-        hash,
-        capacity: 0,
-        filled: 0,
-        pieces_count: 0,
-        pieces_length: 0,
-        torrent: Some(status),
-    };
+            // Get piece information from metadata
+            let (pieces_count, pieces_length, pieces) = if let Some(meta) = &*handle.metadata.load()
+            {
+                let piece_length = meta.lengths.default_piece_length() as i64;
+                let num_pieces = meta.lengths.total_pieces() as i32;
 
-    Ok(Json(cache_state).into_response())
+                // Build pieces map - for streaming we show pieces as available
+                let mut pieces_map = std::collections::HashMap::new();
+                for i in 0..num_pieces {
+                    pieces_map.insert(
+                        i.to_string(),
+                        PieceState {
+                            id: i,
+                            length: piece_length,
+                            size: piece_length,
+                            completed: true, // Mark as completed since librqbit handles streaming
+                            priority: 0,
+                        },
+                    );
+                }
+                (num_pieces, piece_length, pieces_map)
+            } else {
+                (0, 0, std::collections::HashMap::new())
+            };
+
+            let cache_state = CacheState {
+                hash: hash_lower,
+                capacity: torrent_size,
+                filled: stats.progress_bytes as i64,
+                pieces_count,
+                pieces_length,
+                torrent: Some(status),
+                pieces,
+                readers: vec![],
+            };
+
+            Ok(Json(cache_state).into_response())
+        }
+        Err(_) => {
+            // Torrent not found in session - might still be resolving
+            // Return empty cache state with "getting info" status
+            let status = TorrentStatus {
+                title: metadata.title,
+                category: metadata.category,
+                poster: metadata.poster,
+                data: metadata.data,
+                timestamp: metadata.timestamp,
+                name: format!("infohash:{}", hash_lower),
+                hash: hash_lower.clone(),
+                stat: TorrentStat::TorrentGettingInfo as i32,
+                stat_string: "Torrent getting info".to_string(),
+                ..Default::default()
+            };
+
+            let cache_state = CacheState {
+                hash: hash_lower,
+                capacity: 0,
+                filled: 0,
+                pieces_count: 0,
+                pieces_length: 0,
+                torrent: Some(status),
+                pieces: std::collections::HashMap::new(), // Empty but defined
+                readers: vec![],
+            };
+
+            Ok(Json(cache_state).into_response())
+        }
+    }
 }
 
 // ============================================================================
@@ -839,6 +982,25 @@ fn extract_hash(link: &str) -> String {
     } else {
         link.to_lowercase()
     }
+}
+
+fn extract_trackers(link: &str) -> Vec<String> {
+    if !link.starts_with("magnet:") {
+        return vec![];
+    }
+
+    // Parse trackers from magnet link (tr= parameters)
+    link.split('&')
+        .filter_map(|part| {
+            let part = part.trim_start_matches("magnet:?");
+            if part.starts_with("tr=") {
+                // URL decode the tracker
+                urlencoding::decode(&part[3..]).ok().map(|s| s.into_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn find_torrent_id_by_hash(
@@ -1001,5 +1163,136 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+// ============================================================================
+// GET /announce - Retracker endpoint (fetch peers from opentor.org)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct AnnounceQuery {
+    pub info_hash: String,
+    pub peer_id: String,
+    #[serde(default)]
+    pub event: Option<String>,
+    pub port: u16,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub left: u64,
+    #[serde(default)]
+    pub compact: Option<u8>,
+    #[serde(default)]
+    pub no_peer_id: Option<u8>,
+}
+
+
+pub async fn announce_handler(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<AnnounceQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    println!("[RETRACKER] Announce request: info_hash={}", params.info_hash);
+
+    // Parse info_hash (URL-encoded 20 bytes)
+    let info_hash_bytes = urlencoding::decode_binary(params.info_hash.as_bytes());
+    if info_hash_bytes.len() != 20 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid info_hash length: {} (expected 20)", info_hash_bytes.len()),
+        ));
+    }
+    let mut info_hash_array = [0u8; 20];
+    info_hash_array.copy_from_slice(&info_hash_bytes);
+
+    // Parse peer_id (URL-encoded 20 bytes)
+    let peer_id_bytes = urlencoding::decode_binary(params.peer_id.as_bytes());
+    if peer_id_bytes.len() != 20 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid peer_id length: {} (expected 20)", peer_id_bytes.len()),
+        ));
+    }
+    let mut peer_id_array = [0u8; 20];
+    peer_id_array.copy_from_slice(&peer_id_bytes);
+
+    // Convert event string to UDP tracker event code
+    let event = match params.event.as_deref() {
+        Some("started") | None => 2, // EVENT_STARTED
+        Some("completed") => 1,      // EVENT_COMPLETED
+        Some("stopped") => 3,        // EVENT_STOPPED
+        _ => 0,                      // EVENT_NONE
+    };
+
+    println!("[RETRACKER] Contacting UDP tracker: udp://opentor.org:2710");
+
+    // Resolve opentor.org to IP address
+    let tracker_addr = match tokio::net::lookup_host("opentor.org:2710").await {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => {
+                println!("[RETRACKER] Resolved opentor.org to {}", addr);
+                addr
+            }
+            None => {
+                println!("[RETRACKER] DNS lookup returned no addresses");
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Could not resolve opentor.org".to_string(),
+                ));
+            }
+        },
+        Err(e) => {
+            println!("[RETRACKER] DNS lookup failed: {}", e);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("DNS lookup failed: {}", e),
+            ));
+        }
+    };
+
+    // Make UDP tracker announce request using the peer_id from params
+    let result = crate::udp_tracker::announce_to_udp_tracker(
+        tracker_addr,
+        info_hash_array,
+        peer_id_array,
+        params.port,
+        params.uploaded,
+        params.downloaded,
+        params.left,
+        event,
+    )
+    .await;
+
+    match result {
+        Ok(peers) => {
+            println!("[RETRACKER] Received {} peers from opentor.org", peers.len());
+            for peer_addr in &peers {
+                println!("[RETRACKER]   Peer: {}", peer_addr);
+            }
+
+            // Build a simple text response with peer list
+            let mut response_text = format!("d8:intervali1800e5:peers{}:", peers.len() * 6);
+            let mut peers_bytes = Vec::new();
+            for peer_addr in &peers {
+                if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
+                    peers_bytes.extend_from_slice(&ipv4.octets());
+                    peers_bytes.extend_from_slice(&peer_addr.port().to_be_bytes());
+                }
+            }
+            response_text.push_str(&String::from_utf8_lossy(&peers_bytes));
+            response_text.push('e');
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(response_text))
+                .unwrap())
+        }
+        Err(e) => {
+            println!("[RETRACKER] UDP tracker announce failed: {}", e);
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!("UDP tracker announce failed: {}", e),
+            ))
+        }
     }
 }

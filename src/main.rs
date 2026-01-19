@@ -1,10 +1,19 @@
 use librqbit::Session;
-use rqbit_torrserver::{create_router, AppState};
+use rqbit_torrserver::{AppState, create_router};
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() {
+    // Initialize tracing subscriber - default to warn level
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_target(true).with_level(true))
+        .with(filter)
+        .init();
+
     // 1. Initialize the rqbit session
     let session = Session::new("/tmp/downloads".into()).await.unwrap();
 
